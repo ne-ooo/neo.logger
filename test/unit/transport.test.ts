@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { unlink, readFile } from 'node:fs/promises'
+import { lstat, mkdtemp, readFile, readdir, rm, stat, symlink, unlink, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { ConsoleTransport, FileTransport, CustomTransport } from '../../src/core/transport.js'
 import type { LogEntry } from '../../src/types.js'
 
@@ -66,6 +68,17 @@ describe('ConsoleTransport', () => {
     const output = stdoutSpy.mock.calls[0][0]
     expect(output).toMatch(/\n$/)
   })
+
+  it('should wait for stream drain when stdout applies backpressure', async () => {
+    stdoutSpy.mockReturnValueOnce(false)
+    const transport = new ConsoleTransport()
+
+    const write = transport.write(baseEntry)
+    process.stdout.emit('drain')
+    await write
+
+    expect(stdoutSpy).toHaveBeenCalled()
+  })
 })
 
 describe('FileTransport', () => {
@@ -117,6 +130,148 @@ describe('FileTransport', () => {
     expect(JSON.parse(lines[0]!).message).toBe('First')
     expect(JSON.parse(lines[1]!).message).toBe('Second')
   })
+
+  it('should write a batch in order', async () => {
+    const transport = new FileTransport({ path: testFile })
+
+    await transport.writeBatch([
+      { ...baseEntry, message: 'First' },
+      { ...baseEntry, message: 'Second' },
+      { ...baseEntry, message: 'Third' },
+    ])
+
+    const lines = (await readFile(testFile, 'utf8')).trim().split('\n')
+    expect(lines.map((line) => JSON.parse(line).message)).toEqual(['First', 'Second', 'Third'])
+  })
+
+  it('should preserve rotation boundaries within a batch', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'neo-logger-batch-rotation-'))
+    const path = join(directory, 'app.log')
+
+    try {
+      const transport = new FileTransport({ path, rotate: true, maxSize: 1, maxFiles: 3 })
+      await transport.writeBatch([
+        { ...baseEntry, message: 'First' },
+        { ...baseEntry, message: 'Second' },
+        { ...baseEntry, message: 'Third' },
+      ])
+
+      expect(await readFile(path, 'utf8')).toContain('Third')
+      expect(await readFile(`${path}.1`, 'utf8')).toContain('Second')
+      expect(await readFile(`${path}.2`, 'utf8')).toContain('First')
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('should preserve concurrent writes during rotation across transport instances', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'neo-logger-rotation-'))
+    const path = join(directory, 'app.log')
+
+    try {
+      await writeFile(path, 'seed\n')
+      const first = new FileTransport({ path, rotate: true, maxSize: 1, maxFiles: 110 })
+      const second = new FileTransport({ path, rotate: true, maxSize: 1, maxFiles: 110 })
+
+      await Promise.all(
+        Array.from({ length: 100 }, (_, index) =>
+          (index % 2 === 0 ? first : second).write({
+            timestamp: index,
+            level: 'info',
+            message: `message-${index}`,
+          }),
+        ),
+      )
+
+      const files = await readdir(directory)
+      const contents = await Promise.all(files.map((file) => readFile(join(directory, file), 'utf8')))
+      const output = contents.join('')
+
+      for (let index = 0; index < 100; index += 1) {
+        expect(output).toContain(`message-${index}`)
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('should create log files with owner-only permissions by default', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'neo-logger-mode-'))
+    const path = join(directory, 'app.log')
+
+    try {
+      await new FileTransport({ path }).write(baseEntry)
+      const fileStats = await stat(path)
+
+      expect(fileStats.mode & 0o777).toBe(0o600)
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('should reject final-component symlinks by default', async () => {
+    if (process.platform === 'win32') {
+      return
+    }
+
+    const directory = await mkdtemp(join(tmpdir(), 'neo-logger-symlink-'))
+    const target = join(directory, 'target.log')
+    const path = join(directory, 'app.log')
+
+    try {
+      await writeFile(target, 'original\n')
+      await symlink(target, path)
+
+      await expect(
+        new FileTransport({ path, rotate: true, maxSize: 1 }).write(baseEntry),
+      ).rejects.toMatchObject({
+        code: 'ELOOP',
+      })
+      expect(await readFile(target, 'utf8')).toBe('original\n')
+      expect((await lstat(path)).isSymbolicLink()).toBe(true)
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('should allow explicitly configured symlink destinations', async () => {
+    if (process.platform === 'win32') {
+      return
+    }
+
+    const directory = await mkdtemp(join(tmpdir(), 'neo-logger-symlink-'))
+    const target = join(directory, 'target.log')
+    const path = join(directory, 'app.log')
+
+    try {
+      await writeFile(target, '')
+      await symlink(target, path)
+      await new FileTransport({ path, followSymlinks: true }).write(baseEntry)
+
+      expect(await readFile(target, 'utf8')).toContain('Test message')
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('should validate file creation modes', () => {
+    expect(() => new FileTransport({ path: testFile, mode: -1 })).toThrow(RangeError)
+    expect(() => new FileTransport({ path: testFile, mode: 0o1000 })).toThrow(RangeError)
+  })
+
+  it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1])(
+    'should reject invalid maxSize configuration %s',
+    (maxSize) => {
+      expect(() => new FileTransport({ path: testFile, maxSize })).toThrow(RangeError)
+    },
+  )
+
+  it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 10_001])(
+    'should reject invalid maxFiles configuration %s',
+    (maxFiles) => {
+      expect(() => new FileTransport({ path: testFile, maxFiles })).toThrow(RangeError)
+    },
+  )
 })
 
 describe('CustomTransport', () => {

@@ -5,7 +5,7 @@ import type { StackFrame } from '../../src/utils/stack.js'
 describe('parseStack', () => {
   it('returns empty array when error has no stack', () => {
     const error = new Error('no stack')
-    error.stack = undefined
+    delete error.stack
     const frames = parseStack(error)
     expect(frames).toEqual([])
   })

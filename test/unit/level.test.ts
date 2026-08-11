@@ -34,6 +34,11 @@ describe('parseLevel', () => {
     expect(parseLevel('WARN')).toBe(LogLevel.WARN)
   })
 
+  it('should ignore surrounding whitespace', () => {
+    expect(parseLevel('  debug  ')).toBe(LogLevel.DEBUG)
+    expect(parseLevel('\tWARNING\n')).toBe(LogLevel.WARN)
+  })
+
   it('should handle aliases', () => {
     expect(parseLevel('warning')).toBe(LogLevel.WARN)
     expect(parseLevel('none')).toBe(LogLevel.SILENT)
@@ -47,10 +52,17 @@ describe('parseLevel', () => {
     expect(parseLevel(4)).toBe(LogLevel.SILENT)
   })
 
-  it('should default to INFO for invalid levels', () => {
-    expect(parseLevel('invalid')).toBe(LogLevel.INFO)
-    expect(parseLevel('unknown')).toBe(LogLevel.INFO)
+  it.each(['invalid', 'unknown', '', '   '])('should reject invalid string %j', (level) => {
+    expect(() => parseLevel(level)).toThrow(RangeError)
   })
+
+  it.each([-1, 5, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+    'should reject invalid numeric level %s',
+    (level) => {
+      expect(() => parseLevel(level)).toThrow(RangeError)
+    },
+  )
+
 })
 
 describe('shouldLog', () => {

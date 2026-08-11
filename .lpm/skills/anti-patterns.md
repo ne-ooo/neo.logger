@@ -1,6 +1,6 @@
 ---
 name: anti-patterns
-description: Common mistakes when using neo.logger — error() overload confusion, fire-and-forget assumptions, cross-realm errors, and arg order pitfalls
+description: Common mistakes when using neo.logger — error() overload confusion, delivery flushing, queue saturation, cross-realm errors, and arg order pitfalls
 version: "1.0.0"
 globs:
   - "**/*.ts"
@@ -9,7 +9,7 @@ globs:
 
 # Anti-Patterns for @lpm.dev/neo.logger
 
-### [CRITICAL] Passing a plain object to error() instead of an Error instance
+### [CRITICAL] Passing a serialized error without error evidence
 
 Wrong:
 
@@ -20,12 +20,33 @@ logger.error('Request failed', { message: 'timeout', code: 'ETIMEOUT' })
 Correct:
 
 ```typescript
-logger.error('Request failed', new Error('timeout'), { code: 'ETIMEOUT' })
+logger.error('Request failed', {
+  name: 'TimeoutError',
+  message: 'timeout',
+  stack: 'TimeoutError: timeout\n    at request.js:1:1'
+})
 ```
 
-The `error()` method uses `instanceof Error` to disambiguate the second argument. A plain object silently becomes `entry.data` instead of `entry.error` — no stack trace is logged, and the error structure is lost in JSON output. There is no type error or runtime warning.
+Plain objects are valid structured data for `error()`. To identify a serialized object as an error, include a string `message` plus a string `stack` or a `name` that ends in `Error`. Native and cross-realm `Error` instances are detected automatically.
 
-Source: `src/core/logger.ts:90-116` — runtime instanceof check
+Source: `src/utils/error.ts` — conservative error-like detection
+
+### [CRITICAL] Sending secrets to transports without redaction
+
+Wrong:
+
+```typescript
+logger.info('Login request', { password, authorization, cookie })
+```
+
+Correct:
+
+```typescript
+const logger = createLogger({ redact: true })
+logger.info('Login request', { password, authorization, cookie })
+```
+
+Use custom wildcard paths for application-specific PII. Redaction snapshots `entry.data` before any transport sees it. It cannot remove a credential embedded directly in a message or Error.
 
 ### [CRITICAL] Assuming logs are delivered before process.exit()
 
@@ -40,37 +61,46 @@ Correct:
 
 ```typescript
 logger.error('Fatal error', error)
-// Use a timeout to give transports a chance to flush
-setTimeout(() => process.exit(1), 100)
+try {
+  await logger.close()
+} finally {
+  process.exit(1)
+}
 ```
 
-Transport `write()` calls are fire-and-forget with no flush mechanism. `logger.error()` returns `void` synchronously — the actual I/O is an untracked promise. Exiting immediately after logging loses the entry.
+Log methods enqueue asynchronous writes and return `void`. `flush()` waits for accepted writes. `close()` also releases transport resources.
 
-Source: `src/core/logger.ts:148-156` — fire-and-forget `.catch()` pattern
+An immediate process exit can abandon pending entries.
 
-### [HIGH] Cross-realm or deserialized errors bypass instanceof check
+Source: `src/core/logger.ts` — ordered transport queue and delivery lifecycle
+
+### [HIGH] Dropping error identity during serialization
 
 Wrong:
 
 ```typescript
-// Error from a worker thread, structuredClone, or JSON.parse
+// Deserialized object has no stack or Error-like name
 const errorFromWorker = await receiveFromWorker()
 logger.error('Worker failed', errorFromWorker)
-// errorFromWorker is a plain object — lands in entry.data, not entry.error
+// { message, code } is intentionally treated as structured data
 ```
 
 Correct:
 
 ```typescript
 const errorFromWorker = await receiveFromWorker()
-const realError = new Error(errorFromWorker.message)
-realError.stack = errorFromWorker.stack
-logger.error('Worker failed', realError, { originalCode: errorFromWorker.code })
+logger.error('Worker failed', {
+  name: errorFromWorker.name || 'WorkerError',
+  message: errorFromWorker.message,
+  stack: errorFromWorker.stack || `WorkerError: ${errorFromWorker.message}`
+})
 ```
 
-`instanceof Error` returns false for errors from different V8 contexts (workers, vm modules), `structuredClone()` results, or parsed JSON. These silently become data objects.
+Cross-realm `Error` instances work without conversion. Deserialization can discard the prototype and non-enumerable error fields.
 
-Source: `src/core/logger.ts:95` — `instanceof Error` check, maintainer interview
+Preserve `name`, `message`, and `stack` when you send errors across a serialization boundary.
+
+Source: `src/utils/error.ts` — cross-realm and serialized error recognition
 
 ### [HIGH] Using CustomTransport with slow async operations under load
 
@@ -83,7 +113,7 @@ const transport = new CustomTransport(async (entry) => {
     body: JSON.stringify(entry)
   })
 })
-// Under 10k logs/sec, promises accumulate unbounded
+// Under sustained load, the bounded queue can fill and drop newest entries
 ```
 
 Correct:
@@ -98,9 +128,11 @@ const logger = createLogger({
 // Then: fluentd/vector/filebeat reads app.log and ships to your log service
 ```
 
-There is no backpressure, queue, or batching. Each `logger.info()` call spawns an untracked promise per transport. Slow transports cause unbounded promise accumulation leading to OOM under sustained load.
+Each transport has a bounded ordered queue. The default limit is 10,000 pending writes.
 
-Source: `src/core/logger.ts:148-156` — no backpressure in write loop, maintainer interview
+When the queue is full, the logger drops new entries and `flush()` rejects. Use local transports for sustained high-throughput logging.
+
+Source: `src/core/logger.ts` — `maxQueueSize`, `overflowStrategy`, and `flush()`
 
 ### [HIGH] Expecting pino-style argument order (data first, message second)
 
@@ -122,7 +154,7 @@ neo.logger uses `(message, data)` order. Passing an object as the first argument
 
 Source: `src/core/logger.ts:44-66` — method signatures, maintainer interview
 
-### [MEDIUM] Expecting setLevel() on parent to affect existing children
+### [MEDIUM] Assuming child logger levels are independent
 
 Wrong:
 
@@ -131,7 +163,8 @@ const parent = createLogger({ level: 'info', namespace: 'app' })
 const child = parent.child('db')
 
 parent.setLevel('debug')
-child.debug('query details')  // NOT logged — child still has INFO level
+child.setLevel('warn')
+parent.debug('query details')  // NOT logged — the shared level is now WARN
 ```
 
 Correct:
@@ -141,34 +174,35 @@ const parent = createLogger({ level: 'info', namespace: 'app' })
 const child = parent.child('db')
 
 parent.setLevel('debug')
-child.setLevel('debug')  // must set on each child separately
-child.debug('query details')  // now logged
+child.debug('query details')  // logged because the family level is DEBUG
 ```
 
-`child()` creates a new `Logger` instance with a copy of the parent's level at creation time. The parent and child have independent level state.
+The root, children, siblings, and descendants share one live level. Calling `setLevel()` on any member updates the entire family.
 
-Source: `src/core/logger.ts:176-184` — child creates new Logger with spread options
+If a component needs a different level, create an independent root logger.
 
-### [MEDIUM] Relying on invalid level strings to throw errors
+Source: `src/core/logger.ts` — shared `LevelState`
+
+### [MEDIUM] Passing an unchecked environment level directly
 
 Wrong:
 
 ```typescript
-const logger = createLogger({ level: process.env.LOG_LEVEL })
-// If LOG_LEVEL="verbose" (not a valid level), silently defaults to INFO
+const logger = createLogger({ level: process.env.LOG_LEVEL as 'info' })
 ```
 
 Correct:
 
 ```typescript
-const validLevels = ['debug', 'info', 'warn', 'error', 'silent']
-const level = process.env.LOG_LEVEL || 'info'
-if (!validLevels.includes(level)) {
-  throw new Error(`Invalid LOG_LEVEL: ${level}`)
-}
-const logger = createLogger({ level })
+import { createLogger, parseLevel } from '@lpm.dev/neo.logger'
+
+const logger = createLogger({
+  level: parseLevel(process.env.LOG_LEVEL ?? 'info')
+})
 ```
 
-`parseLevel()` returns `LogLevel.INFO` for any unrecognized string. A typo like `LOG_LEVEL=debu` or `LOG_LEVEL=verbose` silently falls back to INFO with no warning.
+`LoggerOptions.level` only accepts known level literals. Use `parseLevel()` at dynamic configuration boundaries.
 
-Source: `src/core/level.ts:43-58` — default case returns INFO
+The function trims and normalizes valid strings. It throws `RangeError` for invalid input.
+
+Source: `src/core/level.ts` — strict parsing and validation

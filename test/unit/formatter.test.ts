@@ -87,6 +87,37 @@ describe('formatConsole', () => {
     expect(infoResult).not.toBe(warnResult)
     expect(warnResult).not.toBe(errorResult)
   })
+
+  it('should escape record-forging and terminal control characters', () => {
+    const result = formatConsole(
+      {
+        ...baseEntry,
+        level: 'info\nforged',
+        namespace: 'api\r\x1b]8;;https://example.com\x07',
+        message: 'accepted\nERROR forged\x1b[2J',
+      },
+      { colors: false, timestamp: false },
+    )
+
+    expect(result).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/u)
+    expect(result).toContain('\\n')
+    expect(result).toContain('\\u001b')
+    expect(result.split('\n')).toHaveLength(1)
+  })
+
+  it('should prefix every physical error continuation line', () => {
+    const error = new Error('failed')
+    error.stack = 'Error: failed\n    at main (app.ts:1:1)\nFORGED\x1b[2J'
+
+    const result = formatConsole({ ...baseEntry, error }, { colors: false })
+    const lines = result.split('\n')
+
+    expect(lines).toHaveLength(4)
+    for (const line of lines.slice(1)) {
+      expect(line.startsWith('  | ')).toBe(true)
+      expect(line).not.toContain('\x1b')
+    }
+  })
 })
 
 describe('formatJSON', () => {
@@ -159,5 +190,69 @@ describe('formatJSON', () => {
     const result = formatJSON(entry)
 
     expect(() => JSON.parse(result)).not.toThrow()
+  })
+
+  it('should serialize BigInt and circular references without dropping the entry', () => {
+    const data: Record<string, any> = { id: 1n }
+    data.self = data
+
+    const result = formatJSON({ ...baseEntry, data })
+    const parsed = JSON.parse(result)
+
+    expect(parsed.message).toBe('Test message')
+    expect(parsed.data.id).toBe('1')
+    expect(parsed.data.self).toBe('[Circular]')
+  })
+
+  it('should preserve the core entry when a data getter throws', () => {
+    const data = Object.create(null) as Record<string, any>
+    Object.defineProperty(data, 'secret', {
+      enumerable: true,
+      get() {
+        throw new Error('getter failed')
+      },
+    })
+
+    const result = formatJSON({ ...baseEntry, data })
+    const parsed = JSON.parse(result)
+
+    expect(parsed.message).toBe('Test message')
+    expect(parsed.data).toBe('[Unserializable data]')
+    expect(parsed.serializationError).toContain('getter failed')
+  })
+
+  it('should include error causes and custom properties', () => {
+    const cause = new Error('root cause')
+    const error = new Error('outer error', { cause }) as Error & { code: string }
+    error.code = 'E_OUTER'
+
+    const result = formatJSON({ ...baseEntry, error })
+    const parsed = JSON.parse(result)
+
+    expect(parsed.error.code).toBe('E_OUTER')
+    expect(parsed.error.cause.message).toBe('root cause')
+  })
+
+  it('should format serialized error-like objects', () => {
+    const error = {
+      name: 'RangeError',
+      message: 'Outside range',
+      stack: 'RangeError: Outside range\n    at worker.js:1:1',
+    }
+
+    const consoleOutput = formatConsole({ ...baseEntry, error }, { colors: false })
+    const jsonOutput = JSON.parse(formatJSON({ ...baseEntry, error }))
+
+    expect(consoleOutput).toContain('RangeError: Outside range')
+    expect(jsonOutput.error).toEqual(error)
+  })
+
+  it('should escape raw Unicode controls while preserving parsed JSON values', () => {
+    const message = 'safe\u202eunsafe'
+    const result = formatJSON({ ...baseEntry, message })
+
+    expect(result).not.toContain('\u202e')
+    expect(result).toContain('\\u202e')
+    expect(JSON.parse(result).message).toBe(message)
   })
 })

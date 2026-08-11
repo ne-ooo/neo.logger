@@ -175,8 +175,14 @@ const logger = winston.createLogger({ handleExceptions: true })
 
 // neo.logger — handle manually
 process.on('uncaughtException', (err) => {
-  logger.error('Uncaught exception', err)
-  setTimeout(() => process.exit(1), 100)  // give transports time to write
+  void (async () => {
+    logger.error('Uncaught exception', err)
+    try {
+      await logger.close()
+    } finally {
+      process.exit(1)
+    }
+  })()
 })
 
 process.on('unhandledRejection', (reason) => {

@@ -31,15 +31,19 @@ export const LogLevelName: Record<LogLevel, string> = {
  * parseLevel('debug') // 0
  * parseLevel('warn')  // 2
  * parseLevel(1)       // 1
- * parseLevel('invalid') // 1 (defaults to INFO)
+ * parseLevel(' WARNING ') // 2
+ * parseLevel('invalid') // throws RangeError
  * ```
  */
 export function parseLevel(level: string | number): LogLevel {
   if (typeof level === 'number') {
-    return level
+    if (!Number.isInteger(level) || level < LogLevel.DEBUG || level > LogLevel.SILENT) {
+      throw new RangeError('Log level number must be an integer between 0 and 4')
+    }
+    return level as LogLevel
   }
 
-  const normalized = level.toLowerCase()
+  const normalized = level.trim().toLowerCase()
   switch (normalized) {
     case 'debug':
       return LogLevel.DEBUG
@@ -54,7 +58,9 @@ export function parseLevel(level: string | number): LogLevel {
     case 'none':
       return LogLevel.SILENT
     default:
-      return LogLevel.INFO
+      throw new RangeError(
+        'Log level must be debug, info, warn, warning, error, silent, or none',
+      )
   }
 }
 

@@ -36,6 +36,13 @@ describe('shouldRotate', () => {
     const result = await shouldRotate(testFile, 1024)
     expect(result).toBe(true)
   })
+
+  it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1])(
+    'should reject invalid maxSize %s',
+    async (maxSize) => {
+      await expect(shouldRotate(testFile, maxSize)).rejects.toThrow(RangeError)
+    },
+  )
 })
 
 describe('rotateFiles', () => {
@@ -141,4 +148,11 @@ describe('rotateFiles', () => {
     const content2 = await readFile(`${baseFile}.2`, 'utf8')
     expect(content2).toBe('backup1')
   })
+
+  it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 10_001])(
+    'should reject invalid maxFiles %s',
+    async (maxFiles) => {
+      await expect(rotateFiles(baseFile, maxFiles)).rejects.toThrow(RangeError)
+    },
+  )
 })

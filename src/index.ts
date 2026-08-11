@@ -54,10 +54,17 @@ export type {
   FormatterOptions,
   FileTransportOptions,
   ConsoleTransportOptions,
+  QueueOverflowStrategy,
+  RedactionConfig,
+  RedactionOptions,
+  ErrorLike,
+  LogLevelInput,
+  LogLevelString,
 } from './types.js'
 
 // Re-export for convenience
 import { Logger } from './core/logger.js'
+import { parseLevel } from './core/level.js'
 import type { LoggerOptions } from './types.js'
 
 /**
@@ -94,7 +101,7 @@ export function createLogger(options?: LoggerOptions): Logger {
  * ```
  */
 const defaultLogger = new Logger({
-  level: process.env.LOG_LEVEL || 'info',
+  level: parseLevel(process.env.LOG_LEVEL ?? 'info'),
 })
 
 export default defaultLogger

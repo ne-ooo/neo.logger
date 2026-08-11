@@ -10,7 +10,7 @@
 ✅ **File logging** - With automatic rotation support
 ✅ **TypeScript-first** - Full type safety with strict mode
 ✅ **ESM + CommonJS** - Works everywhere
-✅ **Fast** - Competitive with pino, simpler than winston
+✅ **Measured hot paths** - Completed-work benchmarks for formatting and delivery
 ✅ **Small** - ~12KB bundle size
 ✅ **Child loggers** - Namespaced loggers with inheritance
 ✅ **Custom transports** - Extensible output system
@@ -37,9 +37,9 @@ Output:
 2024-01-15T10:30:45.123Z INFO  Server started {"port":3000}
 2024-01-15T10:30:46.456Z WARN  High memory usage {"usage":"85%"}
 2024-01-15T10:30:47.789Z ERROR Database connection failed
-Error: Connection refused
-    at connect (database.ts:42:10)
-    at main (app.ts:15:3)
+  | Error: Connection refused
+  |     at connect (database.ts:42:10)
+  |     at main (app.ts:15:3)
 ```
 
 ## Why neo.logger?
@@ -63,7 +63,7 @@ Error: Connection refused
 - ✅ **Actively maintained** - Modern, up-to-date
 - ✅ **Zero dependencies** - No optional deps
 - ✅ **TypeScript-first** - Native TS support
-- ✅ **Better performance** - Modern implementation
+- ✅ **Modern runtime** - Built for Node.js 18 and later
 
 ## API Reference
 
@@ -79,8 +79,9 @@ logger.error("Error message");
 
 // With structured data
 logger.info("User logged in", { userId: 123, ip: "192.168.1.1" });
+logger.error("Request failed", { requestId: "req-123" });
 
-// With error object
+// With an Error or serialized error-like object
 logger.error("Failed to process", error, { taskId: 456 });
 ```
 
@@ -116,6 +117,8 @@ const level = logger.getLevel();
 console.log(LogLevelName[level]); // 'info'
 ```
 
+Level strings are case-insensitive and can have surrounding whitespace. Invalid strings and numeric values outside `0`–`4` throw `RangeError` instead of silently falling back to `info`.
+
 ### Child Loggers
 
 Create namespaced loggers that inherit parent configuration:
@@ -129,6 +132,10 @@ const redisLogger = dbLogger.child("redis");
 
 dbLogger.info("Connected"); // [app:database] Connected
 redisLogger.debug("Cache hit"); // [app:database:redis] Cache hit
+
+// The root, children, siblings, and descendants share one live level.
+logger.setLevel("debug");
+dbLogger.debug("Query details"); // logged
 ```
 
 ## Transports
@@ -159,12 +166,16 @@ const transport = new FileTransport({
   rotate: true, // Enable rotation
   maxSize: 10 * 1024 * 1024, // 10MB
   maxFiles: 5, // Keep 5 backup files
+  mode: 0o600, // Owner read/write only (default)
+  followSymlinks: false, // Reject final-component symlinks (default)
 });
 ```
 
+`maxSize` must be a positive safe integer. `maxFiles` must be an integer from 1 through 10,000. Invalid rotation configuration throws during transport construction.
+
 **Rotation behavior:**
 
-- When `app.log` reaches 10MB, it's renamed to `app.log.1`
+- When `app.log` reaches 10MB, the transport renames it to `app.log.1`
 - Existing backups shift: `app.log.1` → `app.log.2`, etc.
 - Oldest file (`app.log.5`) is deleted
 
@@ -190,6 +201,8 @@ Log to multiple destinations simultaneously:
 
 ```typescript
 const logger = createLogger({
+  maxQueueSize: 10_000, // Maximum pending writes per transport
+  overflowStrategy: "drop-newest", // Or "throw"
   transports: [
     new ConsoleTransport({ colors: true }),
     new FileTransport({ path: "app.log", format: "json" }),
@@ -198,6 +211,65 @@ const logger = createLogger({
   ],
 });
 ```
+
+## Delivery Lifecycle
+
+Calls such as `logger.info()` enqueue accepted asynchronous writes and return immediately. Each transport keeps the call order of its writes.
+
+Before an intentional process exit, wait for delivery:
+
+```typescript
+logger.info("Shutdown requested");
+await logger.close();
+```
+
+`flush()` waits for all accepted writes. It rejects if a transport fails or the bounded queue drops an entry.
+
+Use `flush()` when the logger must remain active. `close()` flushes, calls the transport lifecycle hooks, and prevents later writes.
+
+Each transport accepts at most 10,000 pending writes by default. When the queue is full, the logger reports the failure to stderr.
+
+The logger then drops the newest entry. If the calling code must handle saturation immediately, set `overflowStrategy: "throw"`.
+
+Transports can implement `writeBatch(entries)` for burst delivery. The logger sends no more than 256 ordered entries in one batch.
+
+The logger serializes file writes and rotation by resolved path within one process. This rule also applies to separate `FileTransport` instances.
+
+Multiple processes that write to one file still require an external coordinator such as `logrotate`.
+
+## Security
+
+Enable built-in redaction for common password, token, authorization, cookie, API-key, client-secret,
+and session-ID fields at any depth:
+
+```typescript
+const logger = createLogger({
+  redact: true,
+});
+```
+
+Use dot paths, `*`, and recursive `**` wildcards for application-specific fields:
+
+```typescript
+const logger = createLogger({
+  redact: {
+    paths: ["user.ssn", "payments.*.cardNumber", "request.headers.authorization"],
+    censor: "<hidden>",
+  },
+});
+```
+
+Redaction creates a snapshot before any transport receives structured data. It does not change the caller object.
+
+Redaction applies to `entry.data`. Do not put credentials in the message or error text.
+
+Pretty and text output escape control characters from untrusted fields. Error stacks remain multiline, and each continuation starts with `  | `.
+
+JSON output escapes raw Unicode controls. This escaping does not change the value from `JSON.parse()`.
+
+New log files use mode `0600`. The transport rejects final-component symbolic links with `O_NOFOLLOW` on supported platforms.
+
+Set `followSymlinks: true` only for a trusted destination.
 
 ## Formatting
 
@@ -210,9 +282,9 @@ Colorful, human-readable output for development:
 2024-01-15T10:30:46.456Z INFO  [app:api] Request processed {"method":"GET","path":"/users","duration":45}
 2024-01-15T10:30:47.789Z WARN  [app:db] Connection pool exhausted {"active":100,"idle":0}
 2024-01-15T10:30:48.012Z ERROR [app:worker] Task failed
-Error: Division by zero
-    at calculate (worker.ts:42:10)
-    at process (app.ts:15:3)
+  | Error: Division by zero
+  |     at calculate (worker.ts:42:10)
+  |     at process (app.ts:15:3)
 ```
 
 ### JSON Format (Structured)
@@ -369,10 +441,11 @@ import {
   createLogger,
   FileTransport,
   ConsoleTransport,
+  parseLevel,
 } from "@lpm.dev/neo.logger";
 
 export const logger = createLogger({
-  level: process.env.LOG_LEVEL || "info",
+  level: parseLevel(process.env.LOG_LEVEL ?? "info"),
   namespace: "app",
   transports: [
     new ConsoleTransport(),
@@ -414,9 +487,10 @@ async function processJob(job) {
 
 ## Performance
 
-Neo.logger is designed for production use with competitive performance:
+Neo.logger uses bounded queues and batching for production logging workloads:
 
 - **Fast writes** - Non-blocking async I/O
+- **Burst batching** - Up to 256 queued entries per transport batch
 - **Minimal overhead** - Modern JavaScript patterns
 - **Efficient formatting** - Single-pass string building
 - **Level filtering** - Skip processing for filtered logs
@@ -512,8 +586,10 @@ const logger = createLogger({ level: "info" });
 
 5. **Configure via environment**
    ```typescript
+   import { createLogger, parseLevel } from "@lpm.dev/neo.logger";
+
    const logger = createLogger({
-     level: process.env.LOG_LEVEL || "info",
+     level: parseLevel(process.env.LOG_LEVEL ?? "info"),
    });
    ```
 
@@ -526,7 +602,7 @@ Neo.logger modernizes logging with:
 - Zero dependencies (winston has 20+)
 - Simpler, more intuitive API
 - Native TypeScript support
-- Similar performance with less complexity
+- Smaller API surface and fewer runtime dependencies
 
 ### Why neo.logger instead of pino?
 

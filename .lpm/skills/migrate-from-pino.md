@@ -1,6 +1,6 @@
 ---
 name: migrate-from-pino
-description: Step-by-step guide for migrating from pino to neo.logger — reversed argument order, no worker threads, no pino.final(), transport simplification
+description: Step-by-step guide for migrating from pino to neo.logger — reversed argument order, ordered queues, flush lifecycle, transport simplification
 version: "1.0.0"
 globs:
   - "**/*.ts"
@@ -14,14 +14,14 @@ globs:
 | Aspect | pino | neo.logger |
 |--------|------|------------|
 | Dependencies | ~10 | Zero |
-| Transport architecture | Worker threads (off main thread) | Async on main thread (fire-and-forget) |
+| Transport architecture | Worker threads (off main thread) | Ordered bounded queues on main thread |
 | Pretty printing | Requires `pino-pretty` package | Built-in via ConsoleTransport |
 | Argument order | `(data, message)` | `(message, data)` |
-| Flush on exit | `pino.final()` | No flush mechanism |
-| Backpressure | Worker queue with limits | None — unbounded |
+| Flush on exit | `pino.final()` | `logger.flush()` / `logger.close()` |
+| Backpressure | Worker queue with limits | Bounded queue with drop-or-throw overflow handling |
 | Custom transports | Separate module in worker | Inline function, same process |
 | Serializers | `serializers` option | Not available — format data before passing |
-| Redaction | `redact` paths | Not available — sanitize data before logging |
+| Redaction | `redact` paths | `redact` paths with `*` and `**` wildcards |
 | Startup overhead | ~50ms (worker thread init) | Zero |
 
 ## Step 1: Replace Imports
@@ -131,7 +131,7 @@ logger.error('request failed', error, { reqId: '123' })
 
 ## Step 4: Handle Missing Features
 
-### No pino.final() — flush on exit
+### Replace pino.final() — flush on exit
 
 ```typescript
 // Pino
@@ -141,14 +141,20 @@ const handler = pino.final(logger, (err, finalLogger) => {
 })
 process.on('uncaughtException', handler)
 
-// neo.logger — no flush guarantee, use timeout
+// neo.logger — close waits for delivery and releases transports
 process.on('uncaughtException', (err) => {
-  logger.error('Fatal error', err)
-  setTimeout(() => process.exit(1), 100)
+  void (async () => {
+    logger.error('Fatal error', err)
+    try {
+      await logger.close()
+    } finally {
+      process.exit(1)
+    }
+  })()
 })
 ```
 
-There is no `logger.flush()` or `logger.close()`. Transport writes are fire-and-forget. On process exit, pending writes may be lost.
+Use `flush()` when the logger remains active, or `close()` during final shutdown. Both reject if a transport write failed or the bounded queue dropped an entry.
 
 ### No serializers
 
@@ -170,7 +176,7 @@ logger.info('incoming request', {
 })
 ```
 
-### No redaction
+### Migrate redaction
 
 ```typescript
 // Pino
@@ -178,15 +184,12 @@ const logger = pino({
   redact: ['req.headers.authorization', 'user.password']
 })
 
-// neo.logger — sanitize data before passing
-function sanitize(data) {
-  const clean = { ...data }
-  if (clean.authorization) clean.authorization = '[REDACTED]'
-  if (clean.password) clean.password = '[REDACTED]'
-  return clean
-}
+// neo.logger
+const logger = createLogger({
+  redact: ['req.headers.authorization', 'user.password']
+})
 
-logger.info('User login', sanitize(userData))
+logger.info('User login', userData)
 ```
 
 ### No multistream
@@ -220,16 +223,16 @@ const logger = createLogger({
 
 ## Architecture Difference: No Worker Threads
 
-Pino offloads serialization and I/O to a worker thread — `logger.info()` costs nanoseconds on the main thread. neo.logger runs formatting synchronously on the main thread, then fires async I/O.
+Pino can use worker transports. neo.logger runs transports in the main process and uses an ordered queue for each transport.
 
 | | pino | neo.logger |
 |--|------|------------|
-| Main thread cost | ~nanoseconds | Microseconds (format + serialize) |
-| Under I/O pressure | Worker absorbs it | Main thread feels it |
-| Transport crash | Worker crash isolated | Error swallowed to stderr |
-| Memory under load | Worker queue bounded | Unbounded promise accumulation |
+| Main thread work | Depends on destination and transport | Formatting and transport dispatch |
+| Under I/O pressure | Depends on destination and transport | Bounded queue for each transport |
+| Transport failure | Depends on destination and transport | Diagnostic on stderr and rejected `flush()` |
+| Memory under load | Depends on queue configuration | 10,000 pending entries by default |
 
-For most applications, neo.logger's throughput (8M ops/sec) is more than sufficient. The difference matters at extreme scale (100k+ logs/sec) or with slow custom transports.
+Run an application benchmark with the target workload and destination. The package benchmark does not publish cross-library throughput claims.
 
 ## Migration Checklist
 
@@ -238,8 +241,8 @@ For most applications, neo.logger's throughput (8M ops/sec) is more than suffici
 - [ ] Replace `pino({ transport: { target: 'pino-pretty' }})` with `new ConsoleTransport()`
 - [ ] Replace `pino.destination()` with `FileTransport`
 - [ ] Replace `logger.child({ key: value })` with `logger.child('name')`
-- [ ] Remove `pino.final()` — add manual exit handlers with timeout
+- [ ] Replace `pino.final()` with `await logger.close()` in final exit handlers
 - [ ] Remove `serializers` — serialize data before logging
-- [ ] Remove `redact` — sanitize data before logging
+- [ ] Copy `redact` paths and add `**` where recursive matching is required
 - [ ] Remove `pino-pretty` from dependencies
 - [ ] Remove `pino` from dependencies

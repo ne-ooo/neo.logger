@@ -7,7 +7,16 @@ export default defineConfig({
   splitting: false,
   sourcemap: true,
   clean: true,
-  treeshake: true,
+  treeshake: false,
   minify: false,
   target: 'es2022',
+  footer: ({ format }) =>
+    format === 'cjs'
+      ? {
+          js: `
+const cjsExports = module.exports
+module.exports = Object.assign(cjsExports.default, cjsExports)
+`,
+        }
+      : undefined,
 })

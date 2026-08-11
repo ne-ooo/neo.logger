@@ -11,13 +11,15 @@ globs:
 
 ## Always Use createLogger() in Production
 
-The default logger (`import logger from '@lpm.dev/neo.logger'`) only has `ConsoleTransport` and reads `LOG_LEVEL` once at import. For production, always create an explicit logger:
+The default logger only has `ConsoleTransport`. It reads `LOG_LEVEL` one time when the module loads.
+
+For production, create an explicit logger:
 
 ```typescript
-import { createLogger, ConsoleTransport, FileTransport } from '@lpm.dev/neo.logger'
+import { createLogger, ConsoleTransport, FileTransport, parseLevel } from '@lpm.dev/neo.logger'
 
 export const logger = createLogger({
-  level: process.env.LOG_LEVEL || 'info',
+  level: parseLevel(process.env.LOG_LEVEL ?? 'info'),
   namespace: 'api',
   transports: [
     new ConsoleTransport({ colors: false }),
@@ -52,6 +54,8 @@ log.warn('Slow query', { ms: 1200 })  // [app:db] Slow query
 
 This gives you filterable, structured namespaces in production logs.
 
+All loggers in the family share one live level. A `setLevel()` call on one logger changes the level for the family.
+
 ## Structured Data Over String Interpolation
 
 ```typescript
@@ -62,26 +66,47 @@ logger.info('Request handled', { method: 'GET', path: '/users', status: 200, dur
 logger.info(`GET /users returned 200 in 45ms`)
 ```
 
-Structured data appears in `entry.data` and is preserved as-is in JSON format output. String interpolation loses that structure.
+Structured data appears in `entry.data` and keeps its shape in JSON output unless redaction is enabled. String interpolation loses that structure.
+
+## Redact Sensitive Structured Data
+
+Use `redact: true` for common secret keys at any depth, or provide paths with `*` and `**` wildcards:
+
+```typescript
+const logger = createLogger({
+  redact: {
+    paths: ['user.password', 'request.headers.authorization', 'payments.*.cardNumber'],
+    censor: '<hidden>'
+  }
+})
+```
+
+Redaction occurs before every transport and does not change the source object. Redaction applies only to structured data.
+
+Do not include credentials in a message or error text.
 
 ## Understand Transport Delivery Guarantees
 
-Transport writes are **fire-and-forget**. The `logger.info()` call returns `void` synchronously — there is no way to await delivery.
+Log methods enqueue accepted asynchronous transport writes and return `void`. Use `flush()` or `close()` when delivery must complete.
 
 ```typescript
-// This does NOT guarantee the log was written
 logger.info('Critical event', { orderId: 'abc' })
-process.exit(0)  // pending writes are lost
+await logger.flush()
+process.exit(0)
 ```
 
 Implications:
 
-- **No flush mechanism** — there is no `logger.flush()` or `logger.close()`
+- **Explicit delivery** — `flush()` waits for accepted writes. `close()` also releases transports.
 - **Transport errors go to stderr** — printed as `[neo.logger] Transport write failed: ...`
-- **Partial delivery is normal** — if FileTransport fails (disk full), ConsoleTransport still fires
-- **No backpressure** — high-volume logging with slow transports (HTTP fetch) accumulates promises in memory
+- **Failures are observable** — `flush()` and `close()` reject after a write failure or queue overflow
+- **Bounded queues** — each transport permits 10,000 pending writes by default, then drops newest
 
-For critical audit trails that must be delivered, write to a database or message queue directly — don't rely solely on logger transports.
+Custom transports can implement `writeBatch(entries)` for burst delivery. Each batch contains no more than 256 ordered entries.
+
+If a batch fails, `flush()` reports each entry in that batch as a failed write.
+
+For critical audit trails, write to a database or message queue directly. Do not rely only on logger transports.
 
 ## Keep Transports Fast and Local
 
@@ -90,23 +115,26 @@ The best production setup:
 1. **ConsoleTransport** + **FileTransport** for local output
 2. Ship logs externally via a **sidecar** (fluentd, vector, filebeat) reading the log files
 
-Avoid putting slow HTTP calls in `CustomTransport` for high-throughput paths. Formatting runs on the main thread, and unbounded async writes can cause memory pressure.
+Avoid putting slow HTTP calls in `CustomTransport` for high-throughput paths. A slow handler can fill the bounded queue and cause entries to be dropped.
 
 ## File Rotation Limitations
 
-FileTransport rotation works well for single-process deployments. Be aware:
+FileTransport serializes writes and rotation by resolved path within one process. Be aware:
 
-- **No file locking** — in multi-process setups (PM2 cluster, multiple containers sharing a volume), concurrent rotation can overwrite backups
-- **Size check is not atomic** — two processes can both see the file under `maxSize` and both append past it
+- New files default to mode `0600`
+- Final-component symlinks are rejected unless `followSymlinks: true` is explicit
+- `maxSize` accepts positive safe integers
+- `maxFiles` accepts integers from 1 through 10,000
+- **No cross-process locking** — PM2 workers or containers sharing a volume can still race
 - For multi-process, use a sidecar log rotator (logrotate) instead of built-in rotation
 
 ## Environment-Specific Setup
 
 ```typescript
-import { createLogger, ConsoleTransport, FileTransport } from '@lpm.dev/neo.logger'
+import { createLogger, ConsoleTransport, FileTransport, parseLevel } from '@lpm.dev/neo.logger'
 
 export const logger = createLogger({
-  level: process.env.LOG_LEVEL || 'info',
+  level: parseLevel(process.env.LOG_LEVEL ?? 'info'),
   namespace: process.env.SERVICE_NAME || 'app',
   transports: [
     new ConsoleTransport({
@@ -136,4 +164,6 @@ LOG_LEVEL=silent npx vitest run
 
 ## Monitor stderr for Transport Failures
 
-In production, watch for `[neo.logger] Transport write failed` messages on stderr. These indicate a transport is failing silently and logs may be lost. Set up alerts on this pattern.
+In production, monitor stderr for `[neo.logger] Transport write failed`. This message identifies a transport failure, and log entries can be lost.
+
+Configure an alert for this message.

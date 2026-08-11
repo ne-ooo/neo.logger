@@ -30,7 +30,9 @@
     "test:watch": "vitest",
     "bench": "vitest bench --run",
     "type-check": "tsc --noEmit",
-    "prepublishOnly": "npm run build && npm run test"
+    "test:package": "node test/release/cjs-smoke.cjs && node test/release/esm-smoke.mjs",
+    "release:check": "lpm run type-check && lpm run build && lpm run test && lpm run test:package",
+    "prepublishOnly": "lpm run release:check"
   },
   "keywords": [
     "logger",
@@ -54,22 +56,11 @@
   "bugs": {
     "url": "https://github.com/ne-ooo/neo.logger/issues"
   },
-  "peerDependencies": {
-    "@lpm.dev/neo.colors": "^0.1.0"
-  },
-  "peerDependenciesMeta": {
-    "@lpm.dev/neo.colors": {
-      "optional": true
-    }
-  },
   "devDependencies": {
-    "@lpm.dev/neo.colors": "workspace:*",
     "@types/node": "^20.11.0",
-    "pino": "^10.3.1",
     "tsup": "^8.0.1",
     "typescript": "^5.3.3",
-    "vitest": "^1.6.1",
-    "winston": "^3.19.0"
+    "vitest": "^1.6.1"
   },
   "engines": {
     "node": ">=18.0.0"

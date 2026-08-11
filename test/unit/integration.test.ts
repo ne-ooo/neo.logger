@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest'
-import { createLogger, CustomTransport } from '../../src/index.js'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { createLogger, CustomTransport, FileTransport } from '../../src/index.js'
 import type { LogEntry } from '../../src/index.js'
 
 describe('createLogger', () => {
@@ -29,8 +32,20 @@ describe('createLogger', () => {
     const entries1: LogEntry[] = []
     const entries2: LogEntry[] = []
 
-    const logger1 = createLogger({ transports: [new CustomTransport((e) => entries1.push(e))] })
-    const logger2 = createLogger({ transports: [new CustomTransport((e) => entries2.push(e))] })
+    const logger1 = createLogger({
+      transports: [
+        new CustomTransport((e) => {
+          entries1.push(e)
+        }),
+      ],
+    })
+    const logger2 = createLogger({
+      transports: [
+        new CustomTransport((e) => {
+          entries2.push(e)
+        }),
+      ],
+    })
 
     logger1.info('from logger1')
     expect(entries1).toHaveLength(1)
@@ -118,7 +133,9 @@ describe('concurrent writes', () => {
 describe('end-to-end log pipeline', () => {
   it('full pipeline: createLogger → child → level change → write', async () => {
     const entries: LogEntry[] = []
-    const transport = new CustomTransport((e) => entries.push(e))
+    const transport = new CustomTransport((e) => {
+      entries.push(e)
+    })
 
     const root = createLogger({ level: 'info', namespace: 'app', transports: [transport] })
     const db = root.child('db')
@@ -144,7 +161,11 @@ describe('end-to-end log pipeline', () => {
     const entries: LogEntry[] = []
     const logger = createLogger({
       namespace: 'svc',
-      transports: [new CustomTransport((e) => entries.push(e))],
+      transports: [
+        new CustomTransport((e) => {
+          entries.push(e)
+        }),
+      ],
     })
 
     const mid = logger.child('controller')
@@ -153,5 +174,26 @@ describe('end-to-end log pipeline', () => {
     leaf.warn('404')
     await new Promise((r) => setTimeout(r, 10))
     expect(entries[0]?.namespace).toBe('svc:controller:handler')
+  })
+
+  it('flushes all file entries without arbitrary sleeps', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'neo-logger-flush-'))
+    const path = join(directory, 'app.log')
+
+    try {
+      const logger = createLogger({ transports: [new FileTransport({ path })] })
+      for (let index = 0; index < 1_000; index += 1) {
+        logger.info(`entry-${index}`)
+      }
+
+      await logger.flush()
+
+      const lines = (await readFile(path, 'utf8')).trim().split('\n')
+      expect(lines).toHaveLength(1_000)
+      expect(JSON.parse(lines[0]!).message).toBe('entry-0')
+      expect(JSON.parse(lines[999]!).message).toBe('entry-999')
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
   })
 })

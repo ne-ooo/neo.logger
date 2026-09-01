@@ -123,12 +123,14 @@ new FileTransport({
   rotate: true,                // Enable rotation (default: false)
   maxSize: 10 * 1024 * 1024,   // 10MB (default)
   maxFiles: 5,                 // Keep 5 backups (default)
-  mode: 0o600,                 // Creation permissions (default)
+  mode: 0o600,                 // Maximum target permissions (default)
   followSymlinks: false        // Reject final path symlinks (default)
 })
 ```
 
 `maxSize` must be a positive safe integer. `maxFiles` must be an integer from 1 through 10,000. Invalid values throw during construction.
+
+Rotation cannot be combined with `followSymlinks: true`. On POSIX, existing targets must be regular files owned by the effective process user, with no permission bits beyond `mode`.
 
 ### CustomTransport
 

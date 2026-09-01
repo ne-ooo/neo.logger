@@ -27,9 +27,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - New file logs default to mode `0600` and reject final-component symlinks where supported
 - Invalid log levels and file-rotation limits now fail fast with `RangeError`
 - Cross-realm and serialized error-like values are preserved as errors
+- Error-like classification avoids hostile prototype-chain traversal
 - Existing child logger families now share dynamic level changes
 - File transports batch burst writes while preserving per-entry rotation boundaries
 - Benchmarks now measure completed formatting and delivery work
+- Path redaction now handles aliases, cycles, native errors, and multi-`**` patterns without leaking values or exponential backtracking
+- Redaction size bounds now cover broad objects and oversized sparse arrays with one truncation marker
+- Native Error redaction bounds hostile prototype-chain traversal
+- Saturated transport queues skip unnecessary redaction work for entries that will be dropped
+- Sparse file rotation now scales with existing backups instead of the configured retention limit
+- Rotation-enabled writes reuse the validated active-file descriptor when no rotation is needed
+- Existing log targets are validated for file type, ownership, and configured permission limits before append
+- Rotation now rejects followed symbolic-link destinations instead of silently breaking the link
+- Public stack formatting escapes terminal controls
+- JSON fallbacks preserve primary errors and distinguish repeated error aliases from true cycles
+- Error serialization recursively snapshots nested metadata without invoking custom `toJSON` methods
+- Error serialization bounds deep and broad metadata, including oversized sparse arrays
+- CommonJS consumers now receive declarations matching the runtime default-export compatibility shape
+- Development dependencies are pinned to patched Vitest, Vite, and esbuild lines
 
 ## [1.0.0] - 2026-03-09
 

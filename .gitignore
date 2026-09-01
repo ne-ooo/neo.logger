@@ -16,3 +16,4 @@ coverage
 .lpm/build-state.json
 .lpm/install-hash
 .lpm/trust-snapshot.json
+.lpm/overrides-state.json

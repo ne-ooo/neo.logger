@@ -36,6 +36,10 @@ interface TransportState {
   closePromise?: Promise<void>
 }
 
+type PendingEntry = LogEntry | (() => LogEntry)
+
+class QueueOverflowError extends Error {}
+
 const transportStates = new WeakMap<Transport, TransportState>()
 
 function getTransportState(transport: Transport): TransportState {
@@ -182,7 +186,7 @@ function drainTransport(state: TransportState): void {
 
 function enqueueWrite(
   transport: Transport,
-  entry: LogEntry,
+  pendingEntry: PendingEntry,
   maxQueueSize: number,
   overflowStrategy: QueueOverflowStrategy,
 ): void {
@@ -199,7 +203,7 @@ function enqueueWrite(
   }
 
   if (state.pending >= maxQueueSize) {
-    const error = new Error(
+    const error = new QueueOverflowError(
       `${transportName(transport)} queue is full (${String(maxQueueSize)} pending writes)`,
     )
     recordFailure(state, error)
@@ -216,6 +220,13 @@ function enqueueWrite(
   }
 
   state.pending += 1
+  let entry: LogEntry
+  try {
+    entry = typeof pendingEntry === 'function' ? pendingEntry() : pendingEntry
+  } catch (error) {
+    completeWrite(state)
+    throw error
+  }
   state.queue.push(entry)
   if (!state.active) {
     state.active = true
@@ -377,22 +388,32 @@ export class Logger {
       return
     }
 
-    const transportEntry =
-      this.redaction && entry.data
-        ? { ...entry, data: redactData(entry.data, this.redaction) }
-        : entry
+    let pendingEntry: PendingEntry = entry
+    if (this.redaction && entry.data) {
+      let redactedEntry: LogEntry | undefined
+      pendingEntry = () => {
+        if (redactedEntry === undefined) {
+          redactedEntry = { ...entry, data: redactData(entry.data!, this.redaction!) }
+        }
+        return redactedEntry
+      }
+    }
 
     const overflowErrors: unknown[] = []
     for (const transport of this.transports) {
       try {
         enqueueWrite(
           transport,
-          transportEntry,
+          pendingEntry,
           this.maxQueueSize,
           this.overflowStrategy,
         )
       } catch (error) {
-        overflowErrors.push(error)
+        if (error instanceof QueueOverflowError) {
+          overflowErrors.push(error)
+        } else {
+          throw error
+        }
       }
     }
 

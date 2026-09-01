@@ -121,11 +121,14 @@ Avoid putting slow HTTP calls in `CustomTransport` for high-throughput paths. A 
 
 FileTransport serializes writes and rotation by resolved path within one process. Be aware:
 
-- New files default to mode `0600`
+- New files default to mode `0600`; existing targets cannot be more permissive than `mode`
+- POSIX targets must be regular files owned by the effective process user
 - Final-component symlinks are rejected unless `followSymlinks: true` is explicit
+- `followSymlinks: true` cannot be combined with built-in rotation
 - `maxSize` accepts positive safe integers
 - `maxFiles` accepts integers from 1 through 10,000
 - **No cross-process locking** — PM2 workers or containers sharing a volume can still race
+- Do not put log files in directories writable by untrusted users
 - For multi-process, use a sidecar log rotator (logrotate) instead of built-in rotation
 
 ## Environment-Specific Setup

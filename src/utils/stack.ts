@@ -1,3 +1,5 @@
+import { escapeLogText } from './sanitize.js'
+
 /**
  * Parse error stack trace into structured format
  *
@@ -66,10 +68,10 @@ export function formatStack(error: Error): string {
     .map((frame) => {
       let result = '  at '
       if (frame.function) {
-        result += `${frame.function} `
+        result += `${escapeLogText(frame.function)} `
       }
       if (frame.file) {
-        result += `(${frame.file}:${frame.line || 0}:${frame.column || 0})`
+        result += `(${escapeLogText(frame.file)}:${frame.line || 0}:${frame.column || 0})`
       }
       return result
     })

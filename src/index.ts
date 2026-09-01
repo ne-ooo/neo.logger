@@ -10,7 +10,7 @@
  * logger.info('Server started', { port: 3000 })
  *
  * // Create custom logger
- * import { createLogger, FileTransport } from '@lpm.dev/neo.logger'
+ * import { ConsoleTransport, createLogger, FileTransport } from '@lpm.dev/neo.logger'
  *
  * const logger = createLogger({
  *   level: 'debug',

@@ -137,4 +137,15 @@ describe('formatStack', () => {
     const result = formatStack(error)
     expect(result.length).toBeGreaterThan(0)
   })
+
+  it('escapes terminal controls in function and file names', () => {
+    const error = new Error('unsafe stack')
+    error.stack = 'Error: unsafe stack\n    at attacker\u001b[2J (evil\u202e.js:4:2)'
+
+    const result = formatStack(error)
+
+    expect(result).toBe('  at attacker\\u001b[2J (evil\\u202e.js:4:2)')
+    expect(result).not.toContain('\u001b')
+    expect(result).not.toContain('\u202e')
+  })
 })

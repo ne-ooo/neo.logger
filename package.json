@@ -7,9 +7,14 @@
   "type": "module",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "require": "./dist/index.cjs"
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
     },
     "./package.json": "./package.json"
   },
@@ -25,12 +30,13 @@
   ],
   "sideEffects": false,
   "scripts": {
-    "build": "tsup",
+    "build": "tsup && node scripts/copy-cjs-types.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "bench": "vitest bench --run",
     "type-check": "tsc --noEmit",
-    "test:package": "node test/release/cjs-smoke.cjs && node test/release/esm-smoke.mjs",
+    "test:types": "tsc -p type-smoke/tsconfig.json",
+    "test:package": "node test/release/cjs-smoke.cjs && node test/release/esm-smoke.mjs && lpm run test:types",
     "release:check": "lpm run type-check && lpm run build && lpm run test && lpm run test:package",
     "prepublishOnly": "lpm run release:check"
   },
@@ -60,7 +66,13 @@
     "@types/node": "^20.11.0",
     "tsup": "^8.0.1",
     "typescript": "^5.3.3",
-    "vitest": "^1.6.1"
+    "vitest": "^3.2.7"
+  },
+  "lpm": {
+    "overrides": {
+      "esbuild": "^0.28.1",
+      "vite": "^6.4.3"
+    }
   },
   "engines": {
     "node": ">=18.0.0"

@@ -1,5 +1,17 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { lstat, mkdtemp, readFile, readdir, rm, stat, symlink, unlink, writeFile } from 'node:fs/promises'
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  symlink,
+  unlink,
+  writeFile,
+} from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -144,6 +156,18 @@ describe('FileTransport', () => {
     expect(lines.map((line) => JSON.parse(line).message)).toEqual(['First', 'Second', 'Third'])
   })
 
+  it('should append through a validated rotation descriptor when rotation is not needed', async () => {
+    await writeFile(testFile, 'seed\n', { mode: 0o600 })
+    const transport = new FileTransport({ path: testFile, rotate: true, maxSize: 1_000_000 })
+
+    await transport.write(baseEntry)
+
+    const content = await readFile(testFile, 'utf8')
+    expect(content).toMatch(/^seed\n/)
+    expect(content).toContain('Test message')
+    expect(existsSync(`${testFile}.1`)).toBe(false)
+  })
+
   it('should preserve rotation boundaries within a batch', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'neo-logger-batch-rotation-'))
     const path = join(directory, 'app.log')
@@ -169,7 +193,7 @@ describe('FileTransport', () => {
     const path = join(directory, 'app.log')
 
     try {
-      await writeFile(path, 'seed\n')
+      await writeFile(path, 'seed\n', { mode: 0o600 })
       const first = new FileTransport({ path, rotate: true, maxSize: 1, maxFiles: 110 })
       const second = new FileTransport({ path, rotate: true, maxSize: 1, maxFiles: 110 })
 
@@ -204,6 +228,85 @@ describe('FileTransport', () => {
       const fileStats = await stat(path)
 
       expect(fileStats.mode & 0o777).toBe(0o600)
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('should reject pre-existing files with permissions above the configured mode', async () => {
+    if (process.platform === 'win32') {
+      return
+    }
+
+    const directory = await mkdtemp(join(tmpdir(), 'neo-logger-permissive-mode-'))
+    const path = join(directory, 'app.log')
+
+    try {
+      await writeFile(path, 'original\n', { mode: 0o600 })
+      await chmod(path, 0o666)
+
+      await expect(new FileTransport({ path }).write(baseEntry)).rejects.toMatchObject({
+        code: 'EACCES',
+        message: expect.stringContaining(
+          'permissions 0o666 exceed configured maximum 0o600',
+        ),
+      })
+      expect(await readFile(path, 'utf8')).toBe('original\n')
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('should reject files not owned by the effective process user', async () => {
+    if (process.platform === 'win32' || typeof process.geteuid !== 'function') {
+      return
+    }
+
+    const directory = await mkdtemp(join(tmpdir(), 'neo-logger-foreign-owner-'))
+    const path = join(directory, 'app.log')
+    const posixProcess = process as NodeJS.Process & { geteuid: () => number }
+    const actualUserId = posixProcess.geteuid()
+    const getUserId = vi.spyOn(posixProcess, 'geteuid').mockReturnValue(actualUserId + 1)
+
+    try {
+      await writeFile(path, 'original\n', { mode: 0o600 })
+
+      await expect(new FileTransport({ path }).write(baseEntry)).rejects.toMatchObject({
+        code: 'EPERM',
+        message: expect.stringContaining(`target is owned by uid ${String(actualUserId)}`),
+      })
+      expect(await readFile(path, 'utf8')).toBe('original\n')
+    } finally {
+      getUserId.mockRestore()
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('should reject non-regular targets before writing', async () => {
+    if (process.platform === 'win32') {
+      return
+    }
+
+    await expect(new FileTransport({ path: '/dev/null' }).write(baseEntry)).rejects.toMatchObject({
+      code: 'EINVAL',
+      message: expect.stringContaining('target is not a regular file'),
+    })
+  })
+
+  it('should reject a directory before rotation can move it', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'neo-logger-directory-target-'))
+    const path = join(directory, 'app.log')
+
+    try {
+      await mkdir(path)
+      await writeFile(join(path, 'important'), 'keep')
+
+      await expect(
+        new FileTransport({ path, rotate: true, maxSize: 1 }).write(baseEntry),
+      ).rejects.toBeDefined()
+      expect((await lstat(path)).isDirectory()).toBe(true)
+      expect(await readFile(join(path, 'important'), 'utf8')).toBe('keep')
+      expect(existsSync(`${path}.1`)).toBe(false)
     } finally {
       await rm(directory, { recursive: true, force: true })
     }
@@ -244,7 +347,7 @@ describe('FileTransport', () => {
     const path = join(directory, 'app.log')
 
     try {
-      await writeFile(target, '')
+      await writeFile(target, '', { mode: 0o600 })
       await symlink(target, path)
       await new FileTransport({ path, followSymlinks: true }).write(baseEntry)
 
@@ -252,6 +355,12 @@ describe('FileTransport', () => {
     } finally {
       await rm(directory, { recursive: true, force: true })
     }
+  })
+
+  it('should reject rotation through symbolic links', () => {
+    expect(
+      () => new FileTransport({ path: testFile, rotate: true, followSymlinks: true }),
+    ).toThrow(/rotate and followSymlinks cannot both be enabled/)
   })
 
   it('should validate file creation modes', () => {

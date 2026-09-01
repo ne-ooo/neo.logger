@@ -1,5 +1,5 @@
-import { stat, rename, unlink } from 'node:fs/promises'
-import { resolve } from 'node:path'
+import { lstat, readdir, rename, unlink } from 'node:fs/promises'
+import { basename, dirname, resolve } from 'node:path'
 
 const fileOperationQueues = new Map<string, Promise<void>>()
 const MAX_ROTATION_FILES = 10_000
@@ -25,6 +25,29 @@ function isMissingFileError(error: unknown): boolean {
     'code' in error &&
     (error as { code?: unknown }).code === 'ENOENT'
   )
+}
+
+function unsafeRotationTargetError(path: string): NodeJS.ErrnoException {
+  const error = new Error(
+    `Refusing to rotate non-regular file or symbolic link: ${path}`,
+  ) as NodeJS.ErrnoException
+  error.code = 'EINVAL'
+  return error
+}
+
+async function validateRotationTarget(path: string): Promise<boolean> {
+  try {
+    const stats = await lstat(path)
+    if (!stats.isFile()) {
+      throw unsafeRotationTargetError(path)
+    }
+    return true
+  } catch (error) {
+    if (isMissingFileError(error)) {
+      return false
+    }
+    throw error
+  }
 }
 
 /** @internal Serialize operations that must be atomic within this process. */
@@ -64,7 +87,10 @@ export function withFileLock<T>(path: string, operation: () => Promise<T>): Prom
 export async function shouldRotate(path: string, maxSize: number): Promise<boolean> {
   validateRotationSize(maxSize)
   try {
-    const stats = await stat(path)
+    const stats = await lstat(path)
+    if (!stats.isFile()) {
+      throw unsafeRotationTargetError(path)
+    }
     return stats.size >= maxSize
   } catch (error) {
     if (isMissingFileError(error)) {
@@ -75,11 +101,11 @@ export async function shouldRotate(path: string, maxSize: number): Promise<boole
 }
 
 /**
- * Rotate log files (file.log -> file.1.log -> file.2.log -> ...)
+ * Rotate log files (file.log -> file.log.1 -> file.log.2 -> ...)
  *
- * - Deletes the oldest file (file.{maxFiles}.log)
- * - Renames all existing backup files (file.1.log -> file.2.log)
- * - Renames current file to backup (file.log -> file.1.log)
+ * - Deletes the oldest file (file.log.{maxFiles})
+ * - Renames all existing backup files (file.log.1 -> file.log.2)
+ * - Renames current file to backup (file.log -> file.log.1)
  *
  * @param path - Base file path
  * @param maxFiles - Maximum number of backup files to keep
@@ -87,8 +113,8 @@ export async function shouldRotate(path: string, maxSize: number): Promise<boole
  * @example
  * ```typescript
  * await rotateFiles('app.log', 5)
- * // Before: app.log, app.1.log, app.2.log, ..., app.5.log
- * // After:  [new], app.1.log, app.2.log, ..., app.5.log
+ * // Before: app.log, app.log.1, app.log.2, ..., app.log.5
+ * // After:  [base absent], app.log.1, app.log.2, ..., app.log.5
  * ```
  */
 export async function rotateFiles(path: string, maxFiles: number): Promise<void> {
@@ -99,21 +125,49 @@ export async function rotateFiles(path: string, maxFiles: number): Promise<void>
 /** @internal Rotate while the caller owns the path lock. */
 export async function rotateFilesUnlocked(path: string, maxFiles: number): Promise<void> {
   validateRotationFileCount(maxFiles)
-  const oldestPath = `${path}.${maxFiles}`
+  await validateRotationTarget(path)
+
+  const directory = dirname(path)
+  const backupPrefix = `${basename(path)}.`
+  let directoryEntries: string[]
   try {
-    await unlink(oldestPath)
+    directoryEntries = await readdir(directory)
   } catch (error) {
-    if (!isMissingFileError(error)) {
-      throw error
+    if (isMissingFileError(error)) {
+      return
     }
+    throw error
   }
 
-  for (let i = maxFiles - 1; i >= 1; i--) {
-    const oldPath = `${path}.${i}`
-    const newPath = `${path}.${i + 1}`
+  const existingBackups: number[] = []
+  for (const entry of directoryEntries) {
+    if (!entry.startsWith(backupPrefix)) {
+      continue
+    }
+
+    const suffix = entry.slice(backupPrefix.length)
+    if (!/^[1-9]\d*$/u.test(suffix)) {
+      continue
+    }
+
+    const index = Number(suffix)
+    if (Number.isSafeInteger(index) && index <= maxFiles) {
+      if (await validateRotationTarget(`${path}.${String(index)}`)) {
+        existingBackups.push(index)
+      }
+    }
+  }
+  existingBackups.sort((left, right) => right - left)
+
+  for (const index of existingBackups) {
+    const oldPath = `${path}.${String(index)}`
 
     try {
-      await rename(oldPath, newPath)
+      if (index === maxFiles) {
+        await unlink(oldPath)
+      } else {
+        await rename(oldPath, `${path}.${String(index + 1)}`)
+      }
     } catch (error) {
       if (!isMissingFileError(error)) {
         throw error
@@ -121,6 +175,9 @@ export async function rotateFilesUnlocked(path: string, maxFiles: number): Promi
     }
   }
 
+  if (!(await validateRotationTarget(path))) {
+    return
+  }
   try {
     await rename(path, `${path}.1`)
   } catch (error) {

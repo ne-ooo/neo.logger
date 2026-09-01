@@ -159,6 +159,45 @@ describe('Logger', () => {
       expect(entries[0]?.error).toBeUndefined()
     })
 
+    it('should classify hostile cyclic-prototype values without traversing their prototype', () => {
+      let prototypeTrapCalls = 0
+      let hostileValue: object
+      hostileValue = new Proxy(
+        {},
+        {
+          getPrototypeOf() {
+            prototypeTrapCalls += 1
+            return hostileValue
+          },
+        },
+      )
+      const logger = new Logger({ transports: [mockTransport] })
+
+      expect(() => logger.error('Failed', hostileValue)).not.toThrow()
+      expect(entries[0]?.data === hostileValue).toBe(true)
+      expect(entries[0]?.error).toBeUndefined()
+      expect(prototypeTrapCalls).toBe(0)
+    })
+
+    it('should not invoke accessors while classifying serialized Error-like values', () => {
+      let getterCalls = 0
+      const value = { name: 'MetadataError' } as Record<string, unknown>
+      Object.defineProperty(value, 'message', {
+        enumerable: true,
+        get() {
+          getterCalls += 1
+          return 'spoofed failure'
+        },
+      })
+      const logger = new Logger({ transports: [mockTransport] })
+
+      logger.error('Failed', value)
+
+      expect(entries[0]?.data === value).toBe(true)
+      expect(entries[0]?.error).toBeUndefined()
+      expect(getterCalls).toBe(0)
+    })
+
     it('should include timestamp', () => {
       const logger = new Logger({ transports: [mockTransport] })
       const before = Date.now()
@@ -559,7 +598,7 @@ describe('Logger', () => {
       expect(result?.user).toEqual({ password: '[REDACTED]', name: 'Ada' })
       expect(result?.headers.Authorization).toBe('[REDACTED]')
       expect(result?.headers.cookie).toBe('[REDACTED]')
-      expect(result?.self).toBe(result)
+      expect(result?.self).toBe('[Circular]')
       expect(result).not.toBe(data)
       expect(data.user.password).toBe('hunter2')
     })
@@ -585,6 +624,426 @@ describe('Logger', () => {
 
       expect(redactedEntries[0]?.data?.users[0].ssn).toBe('<hidden>')
       expect(redactedEntries[0]?.data?.payment.details.cardNumber).toBe('<hidden>')
+    })
+
+    it('should match multiple recursive wildcards without recursive backtracking', () => {
+      const redactedEntries: LogEntry[] = []
+      const logger = new Logger({
+        redact: ['**.*.**.*.**.password'],
+        transports: [new CustomTransport((entry) => redactedEntries.push(entry))],
+      })
+      const data: Record<string, any> = {}
+      let current = data
+      for (let index = 0; index < 50; index += 1) {
+        current.child = {}
+        current = current.child
+      }
+      current.password = 'secret'
+
+      logger.info('Request', data)
+
+      let result = redactedEntries[0]?.data
+      for (let index = 0; index < 50; index += 1) {
+        result = result?.child
+      }
+      expect(result?.password).toBe('[REDACTED]')
+    })
+
+    it('should stop broad redaction snapshots with one size marker', () => {
+      const redactedEntries: LogEntry[] = []
+      const logger = new Logger({
+        redact: true,
+        transports: [new CustomTransport((entry) => redactedEntries.push(entry))],
+      })
+      const data = Object.fromEntries(
+        Array.from({ length: 20_000 }, (_, index) => [`value${String(index)}`, index]),
+      )
+
+      logger.info('Request', data)
+
+      expect(redactedEntries[0]?.data).toEqual({
+        value: '[Redaction size limit reached]',
+      })
+    })
+
+    it('should preserve bounded Array length and reject oversized sparse redaction data', () => {
+      const redactedEntries: LogEntry[] = []
+      const logger = new Logger({
+        redact: true,
+        transports: [new CustomTransport((entry) => redactedEntries.push(entry))],
+      })
+      const bounded = new Array(3) as unknown[]
+      bounded[0] = 'first'
+      const sparse: unknown[] = []
+      sparse[10_000_000] = 'last'
+
+      logger.info('Request', { bounded, sparse })
+
+      expect(redactedEntries[0]?.data?.bounded).toHaveLength(3)
+      expect(redactedEntries[0]?.data?.bounded[0]).toBe('first')
+      expect(redactedEntries[0]?.data?.sparse).toBe('[Redaction size limit reached]')
+    })
+
+    it('should retain Array inspection markers at the failing index', () => {
+      let indexDescriptorCalls = 0
+      const hostileArray = new Proxy(['secret'], {
+        getOwnPropertyDescriptor(target, key) {
+          if (key === '0') {
+            indexDescriptorCalls += 1
+            if (indexDescriptorCalls === 2) {
+              throw new Error('descriptor revoked')
+            }
+          }
+          return Reflect.getOwnPropertyDescriptor(target, key)
+        },
+      })
+      const redactedEntries: LogEntry[] = []
+      const logger = new Logger({
+        redact: true,
+        transports: [new CustomTransport((entry) => redactedEntries.push(entry))],
+      })
+
+      logger.info('Request', { values: hostileArray })
+
+      expect(redactedEntries[0]?.data?.values[0]).toBe('[Unable to inspect object safely]')
+      expect(JSON.stringify(redactedEntries[0]?.data?.values)).toContain(
+        '[Unable to inspect object safely]',
+      )
+    })
+
+    it('should clone aliases for each path and replace cycles with a safe marker', () => {
+      const redactedEntries: LogEntry[] = []
+      const logger = new Logger({
+        redact: ['private.password'],
+        transports: [new CustomTransport((entry) => redactedEntries.push(entry))],
+      })
+      const shared: Record<string, any> = { password: 'secret', value: 'visible' }
+      shared.self = shared
+
+      logger.info('Request', { public: shared, private: shared })
+
+      const result = redactedEntries[0]?.data
+      expect(result?.public.password).toBe('secret')
+      expect(result?.private.password).toBe('[REDACTED]')
+      expect(result?.public).not.toBe(result?.private)
+      expect(result?.public.self).toBe('[Circular]')
+      expect(result?.private.self).toBe('[Circular]')
+    })
+
+    it('should preserve native Error fields and redact enumerable metadata without getters', () => {
+      const redactedEntries: LogEntry[] = []
+      let getterCalls = 0
+      const cause = new Error('root cause')
+      const error = new TypeError('outer failure', { cause }) as TypeError &
+        Record<string, unknown>
+      error.code = 'E_OUTER'
+      error.token = 'secret'
+      Object.defineProperty(error, 'computed', {
+        enumerable: true,
+        get() {
+          getterCalls += 1
+          return 'sensitive'
+        },
+      })
+      const logger = new Logger({
+        redact: ['failure.token'],
+        transports: [new CustomTransport((entry) => redactedEntries.push(entry))],
+      })
+
+      logger.info('Request', { failure: error })
+
+      const result = redactedEntries[0]?.data?.failure as TypeError & Record<string, unknown>
+      expect(Object.getPrototypeOf(result)).toBeNull()
+      expect(result).not.toBe(error)
+      expect(result.name).toBe('TypeError')
+      expect(result.message).toBe('outer failure')
+      expect(result.stack).toBe(error.stack)
+      expect(Object.getPrototypeOf(result.cause as object)).toBeNull()
+      expect((result.cause as Error).message).toBe('root cause')
+      expect(result.cause).not.toBe(cause)
+      expect(result.code).toBe('E_OUTER')
+      expect(result.token).toBe('[REDACTED]')
+      expect(result.computed).toBe('[Accessor]')
+      expect(getterCalls).toBe(0)
+    })
+
+    it('should preserve metadata after enumerable native Error core fields', () => {
+      const redactedEntries: LogEntry[] = []
+      const error = new Error('boom') as Error & Record<string, unknown>
+      error.name = 'CustomError'
+      error.code = 'E_CUSTOM'
+      error.detail = 'keep me'
+      const logger = new Logger({
+        redact: true,
+        transports: [new CustomTransport((entry) => redactedEntries.push(entry))],
+      })
+
+      logger.info('Request', { failure: error })
+
+      expect(redactedEntries[0]?.data?.failure).toMatchObject({
+        name: 'CustomError',
+        message: 'boom',
+        code: 'E_CUSTOM',
+        detail: 'keep me',
+      })
+    })
+
+    it('should not invoke hostile native Error core accessors during redaction', () => {
+      const redactedEntries: LogEntry[] = []
+      const accessorCalls: string[] = []
+      const error = new Error('safe')
+      for (const key of ['name', 'message', 'stack', 'cause']) {
+        Object.defineProperty(error, key, {
+          enumerable: true,
+          get() {
+            accessorCalls.push(key)
+            return `attacker-${key}`
+          },
+        })
+      }
+      const logger = new Logger({
+        redact: true,
+        transports: [new CustomTransport((entry) => redactedEntries.push(entry))],
+      })
+
+      logger.info('Request', { failure: error })
+
+      expect(redactedEntries[0]?.data?.failure).toMatchObject({
+        name: '[Accessor]',
+        message: '[Accessor]',
+        stack: '[Accessor]',
+        cause: '[Accessor]',
+      })
+      expect(accessorCalls).toEqual([])
+    })
+
+    it('should not invoke a changed Error.prepareStackTrace hook during redaction', () => {
+      const errorConstructor = Error as ErrorConstructor & {
+        prepareStackTrace?: (error: Error, callSites: unknown[]) => unknown
+      }
+      const originalPrepareStackTrace = errorConstructor.prepareStackTrace
+      let prepareStackTraceCalls = 0
+      errorConstructor.prepareStackTrace = () => {
+        prepareStackTraceCalls += 1
+        return 'attacker-controlled stack'
+      }
+      const redactedEntries: LogEntry[] = []
+      const logger = new Logger({
+        redact: true,
+        transports: [new CustomTransport((entry) => redactedEntries.push(entry))],
+      })
+
+      try {
+        logger.info('Request', { failure: new Error('safe') })
+
+        expect(redactedEntries[0]?.data?.failure.stack).toBe('[Accessor]')
+        expect(prepareStackTraceCalls).toBe(0)
+      } finally {
+        if (originalPrepareStackTrace === undefined) {
+          Reflect.deleteProperty(errorConstructor, 'prepareStackTrace')
+        } else {
+          errorConstructor.prepareStackTrace = originalPrepareStackTrace
+        }
+      }
+    })
+
+    it('should not invoke a cross-realm Error.prepareStackTrace hook during redaction', () => {
+      const realm = { calls: 0 }
+      const error = runInNewContext(
+        `
+          Error.prepareStackTrace = () => {
+            calls += 1
+            return 'cross-realm controlled stack'
+          }
+          new Error('cross-realm failure')
+        `,
+        realm,
+      ) as Error
+      const redactedEntries: LogEntry[] = []
+      const logger = new Logger({
+        redact: true,
+        transports: [new CustomTransport((entry) => redactedEntries.push(entry))],
+      })
+
+      logger.info('Request', { failure: error })
+
+      expect(redactedEntries[0]?.data?.failure.message).toBe('cross-realm failure')
+      expect(redactedEntries[0]?.data?.failure.stack).toBe('[Accessor]')
+      expect(realm.calls).toBe(0)
+    })
+
+    it('should not traverse Proxy boundaries in native Error prototypes during redaction', () => {
+      const trapCalls: string[] = []
+      const proxyPrototype = new Proxy(Error.prototype, {
+        getOwnPropertyDescriptor(target, key) {
+          trapCalls.push(`getOwnPropertyDescriptor:${String(key)}`)
+          return Reflect.getOwnPropertyDescriptor(target, key)
+        },
+        getPrototypeOf(target) {
+          trapCalls.push('getPrototypeOf')
+          return Reflect.getPrototypeOf(target)
+        },
+      })
+      const error = new Error('safe')
+      Object.setPrototypeOf(error, proxyPrototype)
+      const redactedEntries: LogEntry[] = []
+      const logger = new Logger({
+        redact: true,
+        transports: [new CustomTransport((entry) => redactedEntries.push(entry))],
+      })
+
+      logger.info('Request', { failure: error })
+
+      expect(redactedEntries[0]?.data?.failure.message).toBe('safe')
+      expect(redactedEntries[0]?.data?.failure.stack).toBe('[Accessor]')
+      expect(trapCalls).toEqual([])
+    })
+
+    it('should not expose inherited Error metadata through the cloned prototype', () => {
+      class SecretError extends Error {}
+      Object.defineProperty(SecretError.prototype, 'token', {
+        value: 'inherited-secret',
+        enumerable: true,
+      })
+      const redactedEntries: LogEntry[] = []
+      const logger = new Logger({
+        redact: true,
+        transports: [new CustomTransport((entry) => redactedEntries.push(entry))],
+      })
+
+      logger.info('Request', { failure: new SecretError('failed') })
+
+      const result = redactedEntries[0]?.data?.failure
+      expect(Object.getPrototypeOf(result)).toBeNull()
+      expect(result.token).toBeUndefined()
+      expect(result.message).toBe('failed')
+    })
+
+    it('should not invoke hostile prototype traps while classifying built-in values', () => {
+      const redactedEntries: LogEntry[] = []
+      let prototypeTrapCalls = 0
+      const hostileValue = new Proxy(
+        {},
+        {
+          getPrototypeOf() {
+            prototypeTrapCalls += 1
+            throw new Error('prototype trap invoked')
+          },
+        },
+      )
+      const logger = new Logger({
+        redact: true,
+        transports: [new CustomTransport((entry) => redactedEntries.push(entry))],
+      })
+
+      expect(() => logger.info('Request', { hostileValue })).not.toThrow()
+      expect(redactedEntries[0]?.data?.hostileValue === hostileValue).toBe(false)
+      expect(prototypeTrapCalls).toBe(0)
+    })
+
+    it('should stop traversing cyclic Error prototype chains', () => {
+      const redactedEntries: LogEntry[] = []
+      const error = new Error('hostile prototype')
+      let cyclicPrototype: object
+      cyclicPrototype = new Proxy(Object.create(null) as object, {
+        getPrototypeOf() {
+          return cyclicPrototype
+        },
+      })
+      Object.setPrototypeOf(error, cyclicPrototype)
+      const logger = new Logger({
+        redact: true,
+        transports: [new CustomTransport((entry) => redactedEntries.push(entry))],
+      })
+
+      expect(() => logger.info('Request', { error })).not.toThrow()
+      expect(redactedEntries[0]?.data?.error.message).toBe('hostile prototype')
+    })
+
+    it('should clone built-ins without invoking overridden data accessors', () => {
+      const redactedEntries: LogEntry[] = []
+      let accessorCalls = 0
+      const date = new Date('2026-01-02T03:04:05.000Z')
+      Object.defineProperty(date, 'getTime', {
+        get() {
+          accessorCalls += 1
+          return Date.prototype.getTime
+        },
+      })
+      const expression = /secret/giu
+      Object.defineProperty(expression, 'source', {
+        get() {
+          accessorCalls += 1
+          return 'leaked'
+        },
+      })
+      const logger = new Logger({
+        redact: true,
+        transports: [new CustomTransport((entry) => redactedEntries.push(entry))],
+      })
+
+      logger.info('Request', { date, expression })
+
+      expect(redactedEntries[0]?.data?.date.toISOString()).toBe('2026-01-02T03:04:05.000Z')
+      expect(redactedEntries[0]?.data?.expression.source).toBe('secret')
+      expect(redactedEntries[0]?.data?.expression.flags).toBe('giu')
+      expect(accessorCalls).toBe(0)
+    })
+
+    it('should not inspect redacted data when every transport queue drops it', async () => {
+      let release: (() => void) | undefined
+      const gate = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      const transport = new CustomTransport(async () => {
+        await gate
+      })
+      const logger = new Logger({ redact: true, transports: [transport], maxQueueSize: 1 })
+      let inspections = 0
+      const droppedData = new Proxy(
+        { password: 'secret' },
+        {
+          ownKeys(target) {
+            inspections += 1
+            return Reflect.ownKeys(target)
+          },
+        },
+      )
+
+      logger.info('accepted', { safe: true })
+      logger.info('dropped', droppedData)
+      const flushed = logger.flush()
+      release?.()
+
+      await expect(flushed).rejects.toThrow('transport writes failed')
+      expect(inspections).toBe(0)
+    })
+
+    it('should create one redacted snapshot while preserving duplicate transports', () => {
+      const redactedEntries: LogEntry[] = []
+      const transport = new CustomTransport((entry) => redactedEntries.push(entry))
+      let inspections = 0
+      const data = new Proxy(
+        { password: 'secret' },
+        {
+          ownKeys(target) {
+            inspections += 1
+            return Reflect.ownKeys(target)
+          },
+        },
+      )
+      const logger = new Logger({
+        redact: true,
+        transports: [transport, transport],
+        maxQueueSize: 1,
+      })
+
+      logger.info('Request', data)
+
+      expect(redactedEntries).toHaveLength(2)
+      expect(redactedEntries[0]?.data).toBe(redactedEntries[1]?.data)
+      expect(redactedEntries[0]?.data?.password).toBe('[REDACTED]')
+      expect(inspections).toBe(1)
     })
 
     it('should inherit redaction in child loggers without invoking sensitive getters', () => {

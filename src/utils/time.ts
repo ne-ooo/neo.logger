@@ -7,7 +7,7 @@
  * @example
  * ```typescript
  * formatTimestamp(1705318245123)
- * // '2024-01-15T10:30:45.123Z'
+ * // '2024-01-15T11:30:45.123Z'
  * ```
  */
 export function formatTimestamp(timestamp: number): string {
@@ -23,7 +23,7 @@ export function formatTimestamp(timestamp: number): string {
  * @example
  * ```typescript
  * formatHumanTime(1705318245123)
- * // '2024-01-15 10:30:45'
+ * // In the UTC timezone: '2024-01-15 11:30:45'
  * ```
  */
 export function formatHumanTime(timestamp: number): string {

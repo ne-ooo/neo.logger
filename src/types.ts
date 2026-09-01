@@ -106,9 +106,9 @@ export interface FileTransportOptions {
   maxSize?: number
   /** Number of backup files to keep, from 1 through 10000 (default: 5) */
   maxFiles?: number
-  /** Permissions used when creating a log file (default: 0o600) */
+  /** Maximum permissions accepted for new or existing log files (default: 0o600) */
   mode?: number
-  /** Allow the final path component to be a symbolic link (default: false) */
+  /** Allow a trusted final-component symlink; incompatible with rotation (default: false) */
   followSymlinks?: boolean
 }
 

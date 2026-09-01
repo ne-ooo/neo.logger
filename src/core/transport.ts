@@ -1,5 +1,7 @@
 import { constants } from 'node:fs'
-import { lstat, open, stat } from 'node:fs/promises'
+import { open } from 'node:fs/promises'
+import type { Stats } from 'node:fs'
+import type { FileHandle } from 'node:fs/promises'
 import type { LogEntry, Transport, FileTransportOptions, ConsoleTransportOptions } from '../types.js'
 import { formatConsole, formatJSON } from './formatter.js'
 import {
@@ -46,19 +48,88 @@ function isMissingFileError(error: unknown): boolean {
   )
 }
 
-async function getCurrentFileSize(path: string, followSymlinks: boolean): Promise<number> {
-  try {
-    const stats = followSymlinks ? await stat(path) : await lstat(path)
-    if (!followSymlinks && stats.isSymbolicLink()) {
-      const error = new Error(`Refusing to write through symbolic link: ${path}`) as NodeJS.ErrnoException
-      error.code = 'ELOOP'
-      throw error
+function formatFileMode(mode: number): string {
+  return `0o${mode.toString(8).padStart(3, '0')}`
+}
+
+function unsafeLogFileError(path: string, reason: string, code: string): NodeJS.ErrnoException {
+  const error = new Error(`Refusing unsafe log file "${path}": ${reason}`) as NodeJS.ErrnoException
+  error.code = code
+  return error
+}
+
+function validateLogFileStats(stats: Stats, path: string, mode: number): void {
+  if (!stats.isFile()) {
+    throw unsafeLogFileError(path, 'target is not a regular file', 'EINVAL')
+  }
+
+  if (process.platform === 'win32') {
+    return
+  }
+
+  if (typeof process.geteuid === 'function') {
+    const expectedUserId = process.geteuid()
+    if (stats.uid !== expectedUserId) {
+      throw unsafeLogFileError(
+        path,
+        `target is owned by uid ${String(stats.uid)}; expected current process uid ${String(expectedUserId)}`,
+        'EPERM',
+      )
     }
-    return stats.size
+  }
+
+  const actualMode = stats.mode & 0o777
+  const unexpectedPermissions = actualMode & ~mode
+  if (unexpectedPermissions !== 0) {
+    throw unsafeLogFileError(
+      path,
+      `permissions ${formatFileMode(actualMode)} exceed configured maximum ${formatFileMode(mode)}`,
+      'EACCES',
+    )
+  }
+}
+
+async function validateOpenedLogFile(file: FileHandle, path: string, mode: number): Promise<Stats> {
+  const stats = await file.stat()
+  validateLogFileStats(stats, path, mode)
+  return stats
+}
+
+function secureOpenFlags(create: boolean): number {
+  let flags = constants.O_APPEND | constants.O_WRONLY
+  if (create) {
+    flags |= constants.O_CREAT
+  }
+  if (typeof constants.O_NOFOLLOW === 'number') {
+    flags |= constants.O_NOFOLLOW
+  }
+  if (process.platform !== 'win32' && typeof constants.O_NONBLOCK === 'number') {
+    flags |= constants.O_NONBLOCK
+  }
+  return flags
+}
+
+interface OpenedLogFile {
+  file: FileHandle
+  size: number
+}
+
+async function openValidatedLogFile(path: string, mode: number): Promise<OpenedLogFile | undefined> {
+  let file: FileHandle
+  try {
+    file = await open(path, secureOpenFlags(false), mode)
   } catch (error) {
     if (isMissingFileError(error)) {
-      return 0
+      return undefined
     }
+    throw error
+  }
+
+  try {
+    const size = (await validateOpenedLogFile(file, path, mode)).size
+    return { file, size }
+  } catch (error) {
+    await file.close()
     throw error
   }
 }
@@ -133,6 +204,11 @@ export class FileTransport implements Transport {
     if (!Number.isSafeInteger(this.mode) || this.mode < 0 || this.mode > 0o777) {
       throw new RangeError('mode must be an integer between 0o000 and 0o777')
     }
+    if (this.rotate && this.followSymlinks) {
+      throw new RangeError(
+        'rotate and followSymlinks cannot both be enabled because rotation cannot safely preserve a symbolic-link destination',
+      )
+    }
   }
 
   async write(entry: LogEntry): Promise<void> {
@@ -151,50 +227,75 @@ export class FileTransport implements Transport {
     })
 
     await withFileLock(this.path, async () => {
-      let currentSize = 0
-      if (!this.followSymlinks) {
-        currentSize = await getCurrentFileSize(this.path, false)
-      } else if (this.rotate) {
-        currentSize = await getCurrentFileSize(this.path, true)
-      }
-
       if (!this.rotate) {
         await this.append(outputs.join(''))
         return
       }
 
-      let chunk: string[] = []
-      let chunkSize = 0
+      let openedFile = await openValidatedLogFile(this.path, this.mode)
+      let currentSize = openedFile?.size ?? 0
 
-      for (const output of outputs) {
-        if (currentSize + chunkSize >= this.maxSize) {
-          if (chunkSize > 0) {
-            await this.append(chunk.join(''))
+      try {
+        let chunk: string[] = []
+        let chunkSize = 0
+
+        for (const output of outputs) {
+          if (currentSize + chunkSize >= this.maxSize) {
+            if (chunkSize > 0) {
+              if (openedFile !== undefined) {
+                const file = openedFile.file
+                openedFile = undefined
+                await this.appendToOpenedFile(file, chunk.join(''))
+              } else {
+                await this.append(chunk.join(''))
+              }
+            } else if (openedFile !== undefined) {
+              const file = openedFile.file
+              openedFile = undefined
+              await file.close()
+            }
+            await rotateFilesUnlocked(this.path, this.maxFiles)
+            currentSize = 0
+            chunk = []
+            chunkSize = 0
           }
-          await rotateFilesUnlocked(this.path, this.maxFiles)
-          currentSize = 0
-          chunk = []
-          chunkSize = 0
+
+          chunk.push(output)
+          chunkSize += Buffer.byteLength(output)
         }
 
-        chunk.push(output)
-        chunkSize += Buffer.byteLength(output)
-      }
-
-      if (chunkSize > 0) {
-        await this.append(chunk.join(''))
+        if (chunkSize > 0) {
+          if (openedFile !== undefined) {
+            const file = openedFile.file
+            openedFile = undefined
+            await this.appendToOpenedFile(file, chunk.join(''))
+          } else {
+            await this.append(chunk.join(''))
+          }
+        }
+      } finally {
+        await openedFile?.file.close()
       }
     })
   }
 
+  private async appendToOpenedFile(file: FileHandle, output: string): Promise<void> {
+    try {
+      await file.appendFile(output, 'utf8')
+    } finally {
+      await file.close()
+    }
+  }
+
   private async append(output: string): Promise<void> {
-    let flags = constants.O_APPEND | constants.O_CREAT | constants.O_WRONLY
-    if (!this.followSymlinks && typeof constants.O_NOFOLLOW === 'number') {
-      flags |= constants.O_NOFOLLOW
+    let flags = secureOpenFlags(true)
+    if (this.followSymlinks && typeof constants.O_NOFOLLOW === 'number') {
+      flags &= ~constants.O_NOFOLLOW
     }
 
     const file = await open(this.path, flags, this.mode)
     try {
+      await validateOpenedLogFile(file, this.path, this.mode)
       await file.appendFile(output, 'utf8')
     } finally {
       await file.close()
